@@ -33,10 +33,10 @@ include 136.700/.725/.775/.800/.825/.875/.925 MHz (regional allocations vary).
   ```sh
   # dumpvdl2 needs libacars first
   sudo apt install build-essential cmake pkg-config libglib2.0-dev zlib1g-dev libxml2-dev
-  git clone https://github.com/szpajder/libacars
+  git clone https://github.com/F4JTV/libacars
   cd libacars && mkdir build && cd build && cmake .. && make && sudo make install && sudo ldconfig
   cd ../..
-  git clone https://github.com/szpajder/dumpvdl2
+  git clone https://github.com/F4JTV/dumpvdl2
   cd dumpvdl2 && mkdir build && cd build && cmake .. && make && sudo make install
   dumpvdl2 --version          # verify it is on PATH
   ```
