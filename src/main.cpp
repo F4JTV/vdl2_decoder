@@ -34,6 +34,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <functional>
 #include <vector>
 #include <string>
 #include <deque>
@@ -48,7 +49,7 @@ SDRPP_MOD_INFO{
     /* Name:            */ "vdl2_decoder",
     /* Description:     */ "VDL Mode 2 decoder (dumpvdl2 front-end)",
     /* Author:          */ "SDR++ Community",
-    /* Version:         */ 0, 2, 0,
+    /* Version:         */ 0, 3, 0,
     /* Max instances    */ -1
 };
 
@@ -108,7 +109,8 @@ public:
 
     ~VDL2DecoderModule() {
         gui::menu.removeEntry(name);
-        stopDecoder();
+        stopDecoder();                       // blocking (safe: tearing down)
+        if (lifeThread.joinable()) { lifeThread.join(); }
         if (enabled) {
             sink.stop();
             sigpath::vfoManager.deleteVFO(vfo);
@@ -128,14 +130,17 @@ public:
         vfo->setSnapInterval(25000);
         sink.setInput(vfo->output);
         sink.start();
-        startDecoder();
+        startDecoder();          // async; GUI does not block
         enabled = true;
     }
 
     void disable() {
-        stopDecoder();
+        // Stop feeding samples first, then tear down the child in the
+        // background so the GUI thread doesn't stall on the child exit.
+        childStdin.store(-1);    // sink handler becomes a no-op immediately
         sink.stop();
         sigpath::vfoManager.deleteVFO(vfo);
+        stopDecoderAsync();
         enabled = false;
     }
 
@@ -173,7 +178,36 @@ private:
     }
 
     // ---------- Child process lifecycle ----------
-    void startDecoder() {
+    // ---- Public lifecycle entry points: never block the GUI thread. ----
+    void startDecoder()   { schedule([this]{ doStart(); }); }
+    void stopDecoderAsync(){ schedule([this]{ doStop();  }); }
+    void restartDecoder() { schedule([this]{ doStop(); doStart(); }); }
+
+    // Run a lifecycle transition on a detached-ish background thread. Only one
+    // runs at a time (joined before the next is launched); the GUI returns
+    // immediately.
+    void schedule(std::function<void()> fn) {
+#ifndef _WIN32
+        if (lifeThread.joinable()) { lifeThread.join(); } // previous transition done
+        lifeBusy.store(true);
+        lifeThread = std::thread([this, fn]{
+            std::lock_guard<std::mutex> lck(lifeMtx);
+            fn();
+            lifeBusy.store(false);
+        });
+#endif
+    }
+
+    // Blocking stop, used only from the destructor (GUI is already tearing down).
+    void stopDecoder() {
+#ifndef _WIN32
+        if (lifeThread.joinable()) { lifeThread.join(); }
+        std::lock_guard<std::mutex> lck(lifeMtx);
+        doStop();
+#endif
+    }
+
+    void doStart() {
 #ifndef _WIN32
         if (running.load()) { return; }
         status = "starting...";
@@ -223,9 +257,9 @@ private:
 #endif
     }
 
-    void stopDecoder() {
+    void doStop() {
 #ifndef _WIN32
-        if (!running.load()) { return; }
+        if (!running.load() && childPid <= 0) { return; }
         running.store(false);
 
         int sin = childStdin.exchange(-1);
@@ -239,8 +273,6 @@ private:
         status = "stopped";
 #endif
     }
-
-    void restartDecoder() { stopDecoder(); startDecoder(); }
 
 #ifndef _WIN32
     void readerLoop() {
@@ -295,10 +327,27 @@ private:
     }
 #endif
 
+    // Classify a decoded text block by the highest/most-specific layer present,
+    // using the labels dumpvdl2 prints.
+    static int classify(const std::string& b) {
+        if (b.find("CPDLC") != std::string::npos)        return T_CPDLC;
+        if (b.find("ADS-C") != std::string::npos ||
+            b.find("ADS-v") != std::string::npos)        return T_ADSC;
+        if (b.find("ACARS:") != std::string::npos)       return T_ACARS;
+        // CLNP is carried inside X.25, so check the more specific layer first.
+        if (b.find("CLNP") != std::string::npos)          return T_CLNP;
+        if (b.find("X.25") != std::string::npos)          return T_X25;
+        // AVLC supervisory/unnumbered control frames with no upper layer.
+        if (b.find("AVLC type: S") != std::string::npos ||
+            b.find("AVLC type: U") != std::string::npos)  return T_AVLC;
+        return T_OTHER;
+    }
+
     void pushBlock(const std::string& block) {
+        int t = classify(block);
         {
             std::lock_guard<std::mutex> lck(msgMtx);
-            messages.push_back(block);
+            messages.push_back({ block, t });
             if (messages.size() > MAX_LOG_BLOCKS) { messages.pop_front(); }
             newData = true;
         }
@@ -405,10 +454,40 @@ private:
         ImGui::SameLine();
         ImGui::Checkbox(("Auto-scroll##vdl2_as_" + name).c_str(), &autoScroll);
         ImGui::SameLine();
+
+        // Per-type counts (for the filter labels and the total).
+        size_t counts[T_COUNT] = {0};
+        size_t total = 0, shown = 0;
         {
             std::lock_guard<std::mutex> lck(msgMtx);
-            ImGui::Text("  %zu messages", messages.size());
+            total = messages.size();
+            for (auto& m : messages) {
+                int t = (m.type >= 0 && m.type < T_COUNT) ? m.type : T_OTHER;
+                counts[t]++;
+                if (typeFilter[t]) shown++;
+            }
         }
+        ImGui::Text("  %zu shown / %zu total", shown, total);
+
+        // Filter row: one toggle per message type, with All / None shortcuts.
+        ImGui::TextUnformatted("Filter:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(("All##vdl2_fall_" + name).c_str())) {
+            for (int i = 0; i < T_COUNT; i++) typeFilter[i] = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(("None##vdl2_fnone_" + name).c_str())) {
+            for (int i = 0; i < T_COUNT; i++) typeFilter[i] = false;
+        }
+        ImGui::SameLine();
+        for (int i = 0; i < T_COUNT; i++) {
+            char lbl[48];
+            snprintf(lbl, sizeof(lbl), "%s (%zu)##vdl2_f%d_%s",
+                     typeName(i), counts[i], i, name.c_str());
+            ImGui::Checkbox(lbl, &typeFilter[i]);
+            if (i != T_COUNT - 1) ImGui::SameLine();
+        }
+        ImGui::Separator();
 
         ImGui::BeginChild(("vdl2_log_" + name).c_str(), ImVec2(0, 0), true,
                           ImGuiWindowFlags_HorizontalScrollbar);
@@ -416,7 +495,9 @@ private:
         {
             std::lock_guard<std::mutex> lck(msgMtx);
             for (auto& m : messages) {
-                ImGui::TextUnformatted(m.c_str());
+                int t = (m.type >= 0 && m.type < T_COUNT) ? m.type : T_OTHER;
+                if (!typeFilter[t]) continue;
+                ImGui::TextUnformatted(m.text.c_str());
                 ImGui::Separator();
             }
         }
@@ -454,15 +535,31 @@ private:
     std::string status = "idle";
     std::string curBlock;
 
+    // Lifecycle transitions (start/stop/restart) run on this background thread
+    // so the GUI thread never blocks on join()/waitpid(). lifeMtx serializes
+    // them; lifeBusy reflects an in-flight transition for the UI.
+    std::thread lifeThread;
+    std::mutex lifeMtx;
+    std::atomic<bool> lifeBusy{false};
+
     OptionList<std::string, double> channels;
     int chanId = 0;
 
     std::string dumpvdl2Path = "dumpvdl2";
     char pathBuf[512] = {0};
 
+    // A decoded message block plus its detected type (for filtering).
+    enum MsgType { T_ACARS=0, T_X25, T_CLNP, T_CPDLC, T_ADSC, T_AVLC, T_OTHER, T_COUNT };
+    static const char* typeName(int t) {
+        static const char* n[T_COUNT] = {"ACARS","X.25","CLNP","CPDLC","ADS-C","AVLC ctl","Other"};
+        return (t>=0 && t<T_COUNT) ? n[t] : "Other";
+    }
+    struct Msg { std::string text; int type; };
+
     std::mutex msgMtx;
-    std::deque<std::string> messages;
+    std::deque<Msg> messages;
     bool newData = false;
+    bool typeFilter[T_COUNT] = { true,true,true,true,true,true,true };
 
     bool showWindow = false;
     bool autoScroll = true;

@@ -33,10 +33,10 @@ include 136.700/.725/.775/.800/.825/.875/.925 MHz (regional allocations vary).
   ```sh
   # dumpvdl2 needs libacars first
   sudo apt install build-essential cmake pkg-config libglib2.0-dev zlib1g-dev libxml2-dev
-  git clone https://github.com/F4JTV/libacars
+  git clone https://github.com/szpajder/libacars
   cd libacars && mkdir build && cd build && cmake .. && make && sudo make install && sudo ldconfig
   cd ../..
-  git clone https://github.com/F4JTV/dumpvdl2
+  git clone https://github.com/szpajder/dumpvdl2
   cd dumpvdl2 && mkdir build && cd build && cmake .. && make && sudo make install
   dumpvdl2 --version          # verify it is on PATH
   ```
@@ -81,8 +81,12 @@ Idempotent; it copies the module in, adds the `OPT_BUILD_VDL2_DECODER` option an
    `dumpvdl2 not found`, fix the path. Use **Start/Restart** as needed.
 6. Click **Show Messages** to open the log window. Decoded messages appear as
    aircraft transmit, formatted by dumpvdl2 (one block per message).
-7. Optionally tick **Log to file** and pick a folder to append the decoded text
-   to `vdl2_dumpvdl2.log`.
+7. Use the **Filter** row at the top of the window to show or hide message types
+   (ACARS, X.25, CLNP, CPDLC, ADS-C, AVLC control frames, Other). Each toggle
+   shows a live count, and **All**/**None** select or clear everything at once.
+8. Optionally tick **Log to file** and pick a folder to append the decoded text
+   to `vdl2_dumpvdl2.log` (the file always receives every message, regardless of
+   the on-screen filter).
 
 ## How it works
 
@@ -108,7 +112,10 @@ separate thread and split into per-message blocks (each begins with a
   antenna and front-end help considerably.
 - Encrypted or compressed payloads (notably some airline traffic) will not
   decode even with the full dumpvdl2 stack.
-- Changing channel restarts the dumpvdl2 process (its frequency is set at launch).
+- Changing channel restarts the dumpvdl2 process (its frequency is set at
+  launch). Starting, stopping and restarting the decoder are done on a
+  background thread, so enabling the module or switching channel never freezes
+  the SDR++ UI while the child process spins up or shuts down.
 
 ## Tests
 
