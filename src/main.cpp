@@ -1,10 +1,15 @@
 /*
- * VDL Mode 2 decoder module for SDR++.
+ * VDL Mode 2 decoder module for SDR++ (dumpvdl2 front-end).
  *
- * Channelises a VDL2 voice-channel-width slice of spectrum to 105 kHz complex
- * baseband and feeds it to a self-contained D8PSK / AVLC / ACARS decoder
- * (see src/vdl2/). Decoded frames are shown in a detachable message window
- * and can be logged to a TSV file.
+ * This module channelises a VDL2 voice-channel-width slice of spectrum to
+ * 105 kHz complex baseband and pipes it, as interleaved 16-bit I/Q, to a
+ * dumpvdl2 child process (https://github.com/szpajder/dumpvdl2). dumpvdl2's
+ * text output is read back and shown in a detachable log window, giving the
+ * full VDL2 decode (ACARS, X.25/CLNP, CPDLC, ADS-C, ...) integrated into the
+ * SDR++ UI.
+ *
+ * dumpvdl2 must be installed and reachable (on PATH or via the configured
+ * path). This front-end does not decode anything itself.
  */
 #include <imgui.h>
 #include <config.h>
@@ -18,51 +23,54 @@
 #include <utils/optionlist.h>
 #include <dsp/sink/handler_sink.h>
 
-#include <ctime>
-#include <cstdio>
+#ifndef _WIN32
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <cerrno>
+#endif
+
+#include <thread>
+#include <atomic>
 #include <mutex>
 #include <vector>
 #include <string>
-
-#include "vdl2/vdl2.h"
-#include "vdl2/avlc.h"
+#include <deque>
+#include <cstdio>
+#include <cstring>
+#include <cmath>
+#include <ctime>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
 SDRPP_MOD_INFO{
     /* Name:            */ "vdl2_decoder",
-    /* Description:     */ "VDL Mode 2 (aviation VHF Data Link) decoder",
+    /* Description:     */ "VDL Mode 2 decoder (dumpvdl2 front-end)",
     /* Author:          */ "SDR++ Community",
-    /* Version:         */ 0, 1, 0,
+    /* Version:         */ 0, 2, 0,
     /* Max instances    */ -1
 };
 
 ConfigManager config;
 
-// VFO output rate required by the VDL2 demodulator (SPS * symbol rate).
-#define VDL2_SAMPLE_RATE   ((double)vdl2::SAMPLE_RATE) // 105000 Hz
+// VFO output rate = SYMBOL_RATE(10500) * SPS(10) = dumpvdl2 base rate at
+// --oversample 1. Feeding this rate means no resampling is needed.
+#define VDL2_SAMPLE_RATE   105000.0
 #define VDL2_BANDWIDTH     14000.0
-
-// One decoded message as shown in the table / written to the log.
-struct MsgEntry {
-    std::string time;
-    std::string src;
-    std::string dst;
-    std::string typ;    // S->D address types
-    std::string ag;     // Air / Ground
-    std::string proto;
-    std::string label;
-    std::string flight;
-    std::string text;
-    int corr = 0;
-};
+#define MAX_LOG_BLOCKS     4000
 
 class VDL2DecoderModule : public ModuleManager::Instance {
 public:
     VDL2DecoderModule(std::string name) : folderSelect("%ROOT%/recordings") {
         this->name = name;
 
-        // Standard VDL2 channels (kHz in the 136 MHz aeronautical band).
+#ifndef _WIN32
+        // Don't die if the child's stdin pipe breaks; we handle EPIPE.
+        signal(SIGPIPE, SIG_IGN);
+#endif
+
+        // Standard VDL2 channels (Hz).
         channels.define("136.975 (CSC)", 136975000.0);
         channels.define("136.725",       136725000.0);
         channels.define("136.775",       136775000.0);
@@ -74,19 +82,17 @@ public:
 
         // Restore config.
         config.acquire();
-        if (config.conf[name].contains("showWindow"))  { showWindow  = config.conf[name]["showWindow"];  }
-        if (config.conf[name].contains("autoScroll"))  { autoScroll  = config.conf[name]["autoScroll"];  }
-        if (config.conf[name].contains("recording"))   { recording   = config.conf[name]["recording"];   }
-        if (config.conf[name].contains("recordPath"))  { folderSelect.setPath(config.conf[name]["recordPath"]); }
+        if (config.conf[name].contains("dumpvdl2Path")) { dumpvdl2Path = config.conf[name]["dumpvdl2Path"]; }
+        if (config.conf[name].contains("showWindow"))   { showWindow   = config.conf[name]["showWindow"];   }
+        if (config.conf[name].contains("autoScroll"))   { autoScroll   = config.conf[name]["autoScroll"];   }
+        if (config.conf[name].contains("recording"))    { recording    = config.conf[name]["recording"];    }
+        if (config.conf[name].contains("recordPath"))   { folderSelect.setPath(config.conf[name]["recordPath"]); }
         if (config.conf[name].contains("channelId")) {
             std::string cn = config.conf[name]["channelId"];
             if (channels.keyExists(cn)) { chanId = channels.keyId(cn); }
         }
         config.release();
-
-        // Build the decoder. The frame callback runs on the DSP thread.
-        demod = std::make_unique<vdl2::Demodulator>(
-            [this](const vdl2::RawFrame& rf){ this->onRawFrame(rf); });
+        std::strncpy(pathBuf, dumpvdl2Path.c_str(), sizeof(pathBuf) - 1);
 
         // VFO + sink.
         vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER,
@@ -96,11 +102,13 @@ public:
         sink.init(vfo->output, _sinkHandler, this);
         sink.start();
 
+        startDecoder();
         gui::menu.registerEntry(name, menuHandler, this, this);
     }
 
     ~VDL2DecoderModule() {
         gui::menu.removeEntry(name);
+        stopDecoder();
         if (enabled) {
             sink.stop();
             sigpath::vfoManager.deleteVFO(vfo);
@@ -120,10 +128,12 @@ public:
         vfo->setSnapInterval(25000);
         sink.setInput(vfo->output);
         sink.start();
+        startDecoder();
         enabled = true;
     }
 
     void disable() {
+        stopDecoder();
         sink.stop();
         sigpath::vfoManager.deleteVFO(vfo);
         enabled = false;
@@ -132,82 +142,185 @@ public:
     bool isEnabled() { return enabled; }
 
 private:
-    // ---- DSP path ----
+    // ---------- DSP path: float complex -> int16 I/Q -> child stdin ----------
     static void _sinkHandler(dsp::complex_t* data, int count, void* ctx) {
         VDL2DecoderModule* _this = (VDL2DecoderModule*)ctx;
-        // dsp::complex_t is two consecutive floats (re, im); pass straight through.
-        _this->demod->process(reinterpret_cast<const float*>(data), count);
+        int fd = _this->childStdin.load();
+        if (fd < 0) { return; }
+
+        // Convert to interleaved S16_LE (dumpvdl2 divides by 32768 on input).
+        _this->iqBuf.resize((size_t)count * 2);
+        for (int i = 0; i < count; i++) {
+            float re = data[i].re * 32768.0f;
+            float im = data[i].im * 32768.0f;
+            if (re >  32767.0f) re =  32767.0f; if (re < -32768.0f) re = -32768.0f;
+            if (im >  32767.0f) im =  32767.0f; if (im < -32768.0f) im = -32768.0f;
+            _this->iqBuf[2*i]   = (int16_t)lrintf(re);
+            _this->iqBuf[2*i+1] = (int16_t)lrintf(im);
+        }
+#ifndef _WIN32
+        const char* p = (const char*)_this->iqBuf.data();
+        size_t total = _this->iqBuf.size() * sizeof(int16_t);
+        size_t off = 0;
+        while (off < total) {
+            ssize_t w = write(fd, p + off, total - off);
+            if (w > 0) { off += (size_t)w; continue; }
+            if (w < 0 && (errno == EINTR)) { continue; }
+            // EPIPE (child died) or EAGAIN: stop pushing this block.
+            break;
+        }
+#endif
     }
 
-    // Called from the DSP thread when a frame is de-framed.
-    void onRawFrame(const vdl2::RawFrame& rf) {
-        vdl2::Frame f = vdl2::parse_avlc(rf);
-        if (!f.valid || !f.fcs_ok) { return; }
-        // Drop ACARS frames whose sub-block fails structural/BCS validation,
-        // as dumpvdl2 does (these would otherwise show as garbage rows).
-        if (f.acars_malformed) { return; }
+    // ---------- Child process lifecycle ----------
+    void startDecoder() {
+#ifndef _WIN32
+        if (running.load()) { return; }
+        status = "starting...";
 
-        MsgEntry e;
-        char tbuf[16];
-        time_t t = time(nullptr);
-        struct tm* lt = localtime(&t);
-        strftime(tbuf, sizeof(tbuf), "%H:%M:%S", lt);
-        e.time   = tbuf;
-        char ab[16];
-        snprintf(ab, sizeof(ab), "%06X", f.src_addr & 0xFFFFFF); e.src = ab;
-        snprintf(ab, sizeof(ab), "%06X", f.dst_addr & 0xFFFFFF); e.dst = ab;
-        e.typ    = f.srcTypeStr() + "->" + f.dstTypeStr();
-        e.ag     = f.airborne ? "Air" : "Gnd";
-        e.proto  = f.proto;
-        e.label  = f.acars_label;
-        e.flight = f.acars_flight;
-        e.corr   = f.fec_corrections;
-        if (f.has_acars) { e.text = f.acars_text; }
+        int inPipe[2], outPipe[2];   // inPipe: parent->child stdin; outPipe: child stdout->parent
+        if (pipe(inPipe) != 0 || pipe(outPipe) != 0) { status = "pipe() failed"; return; }
 
+        double f = channels.value(chanId);
+        char freqStr[32];
+        snprintf(freqStr, sizeof(freqStr), "%lld", (long long)f);
+        std::string path = pathBuf;
+        if (path.empty()) { path = "dumpvdl2"; }
+
+        pid_t pid = fork();
+        if (pid < 0) { status = "fork() failed"; close(inPipe[0]); close(inPipe[1]); close(outPipe[0]); close(outPipe[1]); return; }
+
+        if (pid == 0) {
+            // ---- child ----
+            dup2(inPipe[0], STDIN_FILENO);
+            dup2(outPipe[1], STDOUT_FILENO);
+            close(inPipe[0]); close(inPipe[1]);
+            close(outPipe[0]); close(outPipe[1]);
+            // The VFO already centres the channel at DC, so freq == centerfreq
+            // (mixer offset 0). --oversample 1 -> 105000 S/s, matching the VFO.
+            execlp(path.c_str(), path.c_str(),
+                   "--iq-file", "-",
+                   "--sample-format", "S16_LE",
+                   "--oversample", "1",
+                   "--centerfreq", freqStr,
+                   freqStr,
+                   "--output", "decoded:text:file:path=-",
+                   (char*)NULL);
+            _exit(127); // execlp failed (e.g. dumpvdl2 not found)
+        }
+
+        // ---- parent ----
+        close(inPipe[0]);   // parent writes to inPipe[1]
+        close(outPipe[1]);  // parent reads from outPipe[0]
+        childPid = pid;
+        childStdout = outPipe[0];
+        childStdin.store(inPipe[1]);
+        running.store(true);
+        readerThread = std::thread(&VDL2DecoderModule::readerLoop, this);
+        status = "running";
+#else
+        status = "front-end mode is Linux-only";
+#endif
+    }
+
+    void stopDecoder() {
+#ifndef _WIN32
+        if (!running.load()) { return; }
+        running.store(false);
+
+        int sin = childStdin.exchange(-1);
+        if (sin >= 0) { close(sin); }      // closing stdin signals EOF to dumpvdl2
+        if (childPid > 0) { kill(childPid, SIGTERM); }
+        if (readerThread.joinable()) { readerThread.join(); }
+        if (childStdout >= 0) { close(childStdout); childStdout = -1; }
+        if (childPid > 0) {
+            int st; waitpid(childPid, &st, 0); childPid = -1;
+        }
+        status = "stopped";
+#endif
+    }
+
+    void restartDecoder() { stopDecoder(); startDecoder(); }
+
+#ifndef _WIN32
+    void readerLoop() {
+        std::string acc;        // accumulates the current message block
+        char buf[4096];
+        bool sawAny = false;
+        while (running.load()) {
+            ssize_t n = read(childStdout, buf, sizeof(buf));
+            if (n > 0) {
+                sawAny = true;
+                acc.append(buf, (size_t)n);
+                // Split into lines; a header line (starts with '[' and contains
+                // "dBFS") begins a new message block.
+                size_t nl;
+                while ((nl = acc.find('\n')) != std::string::npos) {
+                    std::string line = acc.substr(0, nl);
+                    acc.erase(0, nl + 1);
+                    bool isHeader = (!line.empty() && line[0] == '[' &&
+                                     line.find("dBFS") != std::string::npos);
+                    if (isHeader && !curBlock.empty()) {
+                        pushBlock(curBlock);
+                        curBlock.clear();
+                    }
+                    if (!curBlock.empty()) curBlock += "\n";
+                    curBlock += line;
+                }
+            } else if (n == 0) {
+                break;  // child closed stdout (exited)
+            } else {
+                if (errno == EINTR) { continue; }
+                break;
+            }
+        }
+        if (!curBlock.empty()) { pushBlock(curBlock); curBlock.clear(); }
+
+        // Determine why the child ended.
+        if (childPid > 0) {
+            int st = 0;
+            if (waitpid(childPid, &st, WNOHANG) == childPid) {
+                childPid = -1;
+                if (WIFEXITED(st) && WEXITSTATUS(st) == 127) {
+                    status = "dumpvdl2 not found (check the path / PATH)";
+                } else if (!running.load()) {
+                    status = "stopped";
+                } else {
+                    status = "dumpvdl2 exited unexpectedly";
+                }
+            }
+        }
+        if (!sawAny && running.load()) { /* leave status as-is */ }
+        running.store(false);
+    }
+#endif
+
+    void pushBlock(const std::string& block) {
         {
             std::lock_guard<std::mutex> lck(msgMtx);
-            messages.push_back(e);
-            if (messages.size() > 4096) { messages.erase(messages.begin()); }
+            messages.push_back(block);
+            if (messages.size() > MAX_LOG_BLOCKS) { messages.pop_front(); }
             newData = true;
         }
-        writeLog(e);
+        writeLog(block);
     }
 
-    // ---- TSV logging ----
+    // ---------- file logging ----------
     void openLog() {
         if (logFile || !folderSelect.pathIsValid()) { return; }
-        std::string p = folderSelect.path + "/vdl2_log.tsv";
+        std::string p = folderSelect.path + "/vdl2_dumpvdl2.log";
         logFile = fopen(p.c_str(), "a");
-        if (logFile) {
-            fprintf(logFile, "time\tsrc\tdst\ttype\tag\tproto\tlabel\tflight\tcorr\ttext\n");
-            fflush(logFile);
-        }
     }
-    void closeLog() {
-        if (logFile) { fclose(logFile); logFile = nullptr; }
-    }
-    // Replace any character that would break TSV column structure.
-    static std::string tsvSafe(const std::string& in) {
-        std::string o; o.reserve(in.size());
-        for (unsigned char c : in) {
-            if (c == '\t' || c == '\n' || c == '\r') { o += ' '; }
-            else if (c < 0x20 || c == 0x7f) { /* drop other control chars */ }
-            else { o += (char)c; }
-        }
-        return o;
-    }
-    void writeLog(const MsgEntry& e) {
+    void closeLog() { if (logFile) { fclose(logFile); logFile = nullptr; } }
+    void writeLog(const std::string& block) {
         std::lock_guard<std::mutex> lck(logMtx);
         if (!recording || !logFile) { return; }
-        fprintf(logFile, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
-                tsvSafe(e.time).c_str(), tsvSafe(e.src).c_str(), tsvSafe(e.dst).c_str(),
-                tsvSafe(e.typ).c_str(), tsvSafe(e.ag).c_str(), tsvSafe(e.proto).c_str(),
-                tsvSafe(e.label).c_str(), tsvSafe(e.flight).c_str(),
-                e.corr, tsvSafe(e.text).c_str());
+        fwrite(block.data(), 1, block.size(), logFile);
+        fputc('\n', logFile);
         fflush(logFile);
     }
 
-    // ---- GUI ----
+    // ---------- GUI ----------
     static void menuHandler(void* ctx) {
         VDL2DecoderModule* _this = (VDL2DecoderModule*)ctx;
         float menuWidth = ImGui::GetContentRegionAvail().x;
@@ -221,10 +334,28 @@ private:
             config.acquire();
             config.conf[_this->name]["channelId"] = _this->channels.key(_this->chanId);
             config.release(true);
+            _this->restartDecoder();  // dumpvdl2 freq is set via argv -> respawn
         }
 
-        ImGui::LeftLabel("Noise floor");
-        ImGui::Text("%.1f dBFS", _this->demod ? _this->demod->noiseFloorDbfs() : 0.0f);
+        ImGui::LeftLabel("dumpvdl2");
+        ImGui::FillWidth();
+        if (ImGui::InputText(("##vdl2_path_" + _this->name).c_str(), _this->pathBuf, sizeof(_this->pathBuf))) {
+            _this->dumpvdl2Path = _this->pathBuf;
+            config.acquire();
+            config.conf[_this->name]["dumpvdl2Path"] = _this->dumpvdl2Path;
+            config.release(true);
+        }
+
+        ImGui::Text("Status: %s", _this->status.c_str());
+        if (_this->running.load()) {
+            if (ImGui::Button(("Restart##vdl2_re_" + _this->name).c_str(), ImVec2(menuWidth, 0))) {
+                _this->restartDecoder();
+            }
+        } else {
+            if (ImGui::Button(("Start##vdl2_st_" + _this->name).c_str(), ImVec2(menuWidth, 0))) {
+                _this->startDecoder();
+            }
+        }
 
         if (ImGui::Checkbox(("Log to file##vdl2_rec_" + _this->name).c_str(), &_this->recording)) {
             if (_this->recording) { _this->openLog(); } else { _this->closeLog(); }
@@ -254,24 +385,17 @@ private:
     }
 
     void drawWindow() {
-        ImGui::SetNextWindowSize(ImVec2(900, 400), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(820, 480), ImGuiCond_FirstUseEver);
         std::string title = "VDL2 Messages##" + name;
         bool open = ImGui::Begin(title.c_str(), &showWindow);
 
-        // Keep the waterfall VFO from being retuned while the user interacts
-        // with this window. IsWindowHovered() alone returns false whenever an
-        // item is active (column-resize, button press) or when the cursor
-        // leaves the window rect during a resize drag, so we also allow the
-        // "blocked by active item" case and treat a focused window as locked.
-        // This must run even when the window is collapsed (Begin == false),
-        // since a collapsed window can still be moved/resized.
+        // Keep the waterfall VFO from being retuned while interacting here.
         ImGuiHoveredFlags hf = ImGuiHoveredFlags_RootAndChildWindows |
                                ImGuiHoveredFlags_AllowWhenBlockedByActiveItem;
         if (ImGui::IsWindowHovered(hf) ||
             ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
             gui::mainWindow.lockWaterfallControls = true;
         }
-
         if (!open) { ImGui::End(); return; }
 
         if (ImGui::Button(("Clear##vdl2_clr_" + name).c_str())) {
@@ -283,48 +407,28 @@ private:
         ImGui::SameLine();
         {
             std::lock_guard<std::mutex> lck(msgMtx);
-            ImGui::Text("  %zu frames", messages.size());
+            ImGui::Text("  %zu messages", messages.size());
         }
 
-        const int COLS = 9;
-        if (ImGui::BeginTable(("vdl2_tbl_" + name).c_str(), COLS,
-                              ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                              ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
-            ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("Time",   ImGuiTableColumnFlags_WidthFixed, 70);
-            ImGui::TableSetupColumn("Src",    ImGuiTableColumnFlags_WidthFixed, 60);
-            ImGui::TableSetupColumn("Dst",    ImGuiTableColumnFlags_WidthFixed, 60);
-            ImGui::TableSetupColumn("Type",   ImGuiTableColumnFlags_WidthFixed, 150);
-            ImGui::TableSetupColumn("A/G",    ImGuiTableColumnFlags_WidthFixed, 40);
-            ImGui::TableSetupColumn("Proto",  ImGuiTableColumnFlags_WidthFixed, 70);
-            ImGui::TableSetupColumn("Label",  ImGuiTableColumnFlags_WidthFixed, 50);
-            ImGui::TableSetupColumn("Flight", ImGuiTableColumnFlags_WidthFixed, 70);
-            ImGui::TableSetupColumn("Text",   ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableHeadersRow();
-
+        ImGui::BeginChild(("vdl2_log_" + name).c_str(), ImVec2(0, 0), true,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::PushFont(NULL); // default font (monospace-ish handled by theme)
+        {
             std::lock_guard<std::mutex> lck(msgMtx);
-            for (auto& e : messages) {
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(e.time.c_str());
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(e.src.c_str());
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(e.dst.c_str());
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(e.typ.c_str());
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(e.ag.c_str());
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(e.proto.c_str());
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(e.label.c_str());
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(e.flight.c_str());
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(e.text.c_str());
+            for (auto& m : messages) {
+                ImGui::TextUnformatted(m.c_str());
+                ImGui::Separator();
             }
-            if (autoScroll && newData) {
-                ImGui::SetScrollHereY(1.0f);
-                newData = false;
-            }
-            ImGui::EndTable();
         }
+        ImGui::PopFont();
+        if (autoScroll && newData) {
+            ImGui::SetScrollHereY(1.0f);
+            newData = false;
+        }
+        ImGui::EndChild();
 
         ImGui::End();
 
-        // Persist window-closed state.
         static bool lastShow = true;
         if (lastShow && !showWindow) {
             config.acquire();
@@ -339,13 +443,25 @@ private:
 
     VFOManager::VFO* vfo = nullptr;
     dsp::sink::Handler<dsp::complex_t> sink;
-    std::unique_ptr<vdl2::Demodulator> demod;
+    std::vector<int16_t> iqBuf;
+
+    // child process
+    std::atomic<int> childStdin{-1};
+    int childStdout = -1;
+    pid_t childPid = -1;
+    std::thread readerThread;
+    std::atomic<bool> running{false};
+    std::string status = "idle";
+    std::string curBlock;
 
     OptionList<std::string, double> channels;
     int chanId = 0;
 
+    std::string dumpvdl2Path = "dumpvdl2";
+    char pathBuf[512] = {0};
+
     std::mutex msgMtx;
-    std::vector<MsgEntry> messages;
+    std::deque<std::string> messages;
     bool newData = false;
 
     bool showWindow = false;

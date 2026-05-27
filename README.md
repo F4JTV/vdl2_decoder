@@ -1,127 +1,123 @@
-# VDL Mode 2 Decoder for SDR++
+# VDL Mode 2 Decoder for SDR++ (dumpvdl2 front-end)
 
-A self-contained SDR++ plugin that decodes **VDL Mode 2** (VHF Data Link Mode 2),
-the digital data link used in civil aviation for ACARS-over-AVLC and ATN/X.25
-messaging. It demodulates the D8PSK signal directly from complex baseband,
-performs forward error correction, reassembles AVLC frames and decodes embedded
-ACARS messages, displaying them in a detachable message window with optional TSV
-logging.
+An SDR++ plugin that brings full **VDL Mode 2** (VHF Data Link Mode 2) decoding
+into the SDR++ UI by driving [dumpvdl2](https://github.com/szpajder/dumpvdl2) as
+a child process. The module channelises a VDL2 channel to 105 kHz complex
+baseband, pipes it to dumpvdl2 as 16-bit I/Q, and displays dumpvdl2's decoded
+text output in a detachable, scrolling log window.
 
-The decoder is a clean C++ port of the physical- and link-layer chain of
-[dumpvdl2](https://github.com/szpajder/dumpvdl2) (GPLv3) and has **no external
-runtime dependencies** — the Reed–Solomon codec is vendored, so no `libfec`,
-`libacars` or `glib` are required.
+Because the work is done by dumpvdl2, you get its **complete** decode chain:
+ACARS over AVLC, plus the higher network/application layers — X.25/ISO 8208,
+CLNP, and the ATN applications (CPDLC controller-pilot clearances, ADS-C
+position/telemetry reports, Context Management), as well as MIAM — all rendered
+exactly as dumpvdl2 formats them, but integrated with the SDR++ waterfall, VFO
+and multi-channel UI.
+
+> This module is a **front-end**: it does not decode anything itself. **dumpvdl2
+> must be installed** and reachable (on `PATH` or via the configured path).
 
 ## What is VDL Mode 2?
 
-VDL2 is a 31.5 kbit/s digital link in the 136 MHz aeronautical band. Key
-parameters:
+VDL2 is a 31.5 kbit/s digital link in the 136 MHz aeronautical band: differential
+8-PSK, 10 500 symbols/s (3 bits/symbol), Reed–Solomon RS(255,249), AVLC link
+layer. The Common Signalling Channel is 136.975 MHz; other channels in common use
+include 136.700/.725/.775/.800/.825/.875/.925 MHz (regional allocations vary).
 
-| Parameter | Value |
-|-----------|-------|
-| Modulation | Differential 8-PSK (D8PSK), Gray-coded |
-| Symbol rate | 10 500 symbols/s (3 bits/symbol → 31 500 bit/s) |
-| Forward error correction | Reed–Solomon RS(255, 249) over GF(256) |
-| Link layer | AVLC (Aviation VHF Link Control), HDLC-framed |
-| Payload | ACARS, X.25/CLNP, XID |
-| Common Signalling Channel | 136.975 MHz |
+## Requirements
 
-Other channels frequently in use include 136.700, 136.725, 136.775, 136.800,
-136.825, 136.875 and 136.925 MHz (regional allocations vary).
+- **Linux** (the front-end uses POSIX `fork`/`exec`/`pipe`; Windows is not
+  supported in this mode).
+- **dumpvdl2**, built and installed. It is not packaged in the Ubuntu
+  repositories, so build it from source:
 
-## Features
+  ```sh
+  # dumpvdl2 needs libacars first
+  sudo apt install build-essential cmake pkg-config libglib2.0-dev zlib1g-dev libxml2-dev
+  git clone https://github.com/szpajder/libacars
+  cd libacars && mkdir build && cd build && cmake .. && make && sudo make install && sudo ldconfig
+  cd ../..
+  git clone https://github.com/szpajder/dumpvdl2
+  cd dumpvdl2 && mkdir build && cd build && cmake .. && make && sudo make install
+  dumpvdl2 --version          # verify it is on PATH
+  ```
 
-- Direct complex-baseband D8PSK demodulation with preamble synchronisation.
-- LFSR descrambling, block de-interleaving and Reed–Solomon error correction
-  (with erasure handling for short final blocks).
-- HDLC de-framing and AVLC parsing: source/destination DLC addresses and types,
-  air/ground status, command/response, and link control field classification
-  (I/S/U frames).
-- ACARS decoding: registration, label, block id, technical acknowledgement,
-  downlink message sequence and flight id, and free text. The ACARS Block Check
-  Sequence is verified and structurally-malformed sub-blocks are rejected, so
-  only well-formed messages are shown (matching dumpvdl2's behaviour).
-- Detachable message window with a sortable table, auto-scroll, a clear button,
-  a live noise-floor readout and a one-click channel selector.
-- Optional TSV logging to a folder of your choice.
-- Multiple independent instances (decode several channels at once).
-- Settings are persisted across sessions.
+## Building the module (Ubuntu 24.04)
 
-## Building (Ubuntu 24.04)
+Place this folder at `decoder_modules/vdl2_decoder/` in an
+[SDR++](https://github.com/AlexandreRouma/SDRPlusPlus) checkout (the included
+`apply_to_sdrpp.sh` does this and wires up the build), then:
 
-The module builds as part of the SDR++ tree. From a checkout of
-[SDR++](https://github.com/AlexandreRouma/SDRPlusPlus):
+```sh
+cd SDRPlusPlus
+mkdir -p build && cd build
+cmake .. -DOPT_BUILD_VDL2_DECODER=ON
+make -j$(nproc)
+sudo make install
+```
 
-1. Place this folder at `decoder_modules/vdl2_decoder/` (the included
-   `apply_to_sdrpp.sh` does this and wires up the build for you — see below).
-2. Configure and build SDR++ as usual:
-
-   ```sh
-   cd SDRPlusPlus
-   mkdir -p build && cd build
-   cmake .. -DOPT_BUILD_VDL2_DECODER=ON
-   make -j$(nproc)
-   sudo make install
-   ```
-
-No extra system packages are needed beyond SDR++'s own build dependencies
-(`build-essential`, `cmake`, `libfftw3-dev`, `libvolk-dev`, `libglfw3-dev`, …).
+The module itself has no external library dependencies (it only links pthreads);
+dumpvdl2 is a *runtime* dependency, invoked as a separate process.
 
 ### Automated integration
-
-Run the helper script from anywhere, passing the path to your SDR++ source tree:
 
 ```sh
 ./apply_to_sdrpp.sh /path/to/SDRPlusPlus
 ```
 
-It is idempotent and performs three edits:
-
-- copies the module into `decoder_modules/vdl2_decoder/`;
-- adds the `OPT_BUILD_VDL2_DECODER` option and `add_subdirectory(...)` to the
-  root `CMakeLists.txt`;
-- registers `vdl2_decoder.so` in the default module list in
-  `core/src/core.cpp` so it loads automatically.
-
-Re-run `cmake`/`make` afterwards.
+Idempotent; it copies the module in, adds the `OPT_BUILD_VDL2_DECODER` option and
+`add_subdirectory(...)` to the root `CMakeLists.txt`, and registers
+`vdl2_decoder.so` in the default module list in `core/src/core.cpp`.
 
 ## Usage
 
-1. Start SDR++ and start your SDR device.
-2. Enable the **vdl2_decoder** module (Module Manager) if it is not already
-   loaded; a new entry appears in the menu.
-3. Pick a channel from the **Channel** dropdown (defaults to 136.975 MHz, the
-   Common Signalling Channel). This tunes the radio for you. The VFO is locked
-   to a 14 kHz bandwidth and produces the 105 kHz baseband the decoder needs.
-4. Click **Show Messages** to open the message window. Decoded frames appear as
-   aircraft transmit; the **Noise floor** readout helps you confirm the channel
-   is centred.
-5. To save traffic, tick **Log to file**, choose a folder, and a
-   `vdl2_log.tsv` file will be appended to.
+1. Start SDR++ and your SDR device.
+2. Enable the **vdl2_decoder** module if needed.
+3. If `dumpvdl2` is not on your `PATH`, type its full path in the **dumpvdl2**
+   field.
+4. Pick a **Channel** (defaults to 136.975 MHz CSC). This tunes the radio and
+   restarts dumpvdl2 for the new frequency. The VFO is locked to 14 kHz and
+   produces the 105 kHz baseband dumpvdl2 expects.
+5. Watch **Status** — it should read `running`. If it shows
+   `dumpvdl2 not found`, fix the path. Use **Start/Restart** as needed.
+6. Click **Show Messages** to open the log window. Decoded messages appear as
+   aircraft transmit, formatted by dumpvdl2 (one block per message).
+7. Optionally tick **Log to file** and pick a folder to append the decoded text
+   to `vdl2_dumpvdl2.log`.
 
-### Reading the table
+## How it works
 
-| Column | Meaning |
-|--------|---------|
-| Time | Local time the frame was decoded |
-| Src / Dst | 24-bit DLC addresses (hex) |
-| Type | Source → destination address types (Aircraft / Ground station / …) |
-| A/G | Air or Ground status of the addressed station |
-| Proto | Higher-layer protocol (ACARS, X.25, XID, …) |
-| Label | ACARS message label |
-| Flight | Flight id (downlink ACARS) |
-| Text | ACARS free-text payload |
+The module creates a VFO whose output sample rate is exactly
+`10 500 × 10 = 105 000 Hz` — dumpvdl2's internal rate at `--oversample 1` — so no
+resampling is required. Each VFO block of complex floats is converted to
+interleaved signed 16-bit I/Q (matching dumpvdl2's `S16_LE` input, which divides
+by 32768) and written to the child's stdin. dumpvdl2 is launched as:
+
+```
+dumpvdl2 --iq-file - --sample-format S16_LE --oversample 1 \
+         --centerfreq <chan_Hz> <chan_Hz> --output decoded:text:file:path=-
+```
+
+Since the VFO already centres the channel at DC, the channel frequency equals the
+center frequency (zero mixer offset). dumpvdl2's text output is read back on a
+separate thread and split into per-message blocks (each begins with a
+`[timestamp] [freq] [… dBFS] …` header).
 
 ## Notes & limitations
 
-- The module needs a clean, correctly tuned signal; VDL2 bursts are short, so a
-  good antenna and front-end help considerably.
-- Higher network-layer PDUs (X.25 / CLNP) are identified and framed but their
-  full contents are not decoded — the focus is ACARS-over-AVLC.
-- Only FCS-valid AVLC frames are displayed; frames that Reed–Solomon cannot
-  repair, and ACARS sub-blocks that fail structural/BCS validation, are dropped.
+- A clean, correctly tuned signal is needed; VDL2 bursts are short, so a good
+  antenna and front-end help considerably.
+- Encrypted or compressed payloads (notably some airline traffic) will not
+  decode even with the full dumpvdl2 stack.
+- Changing channel restarts the dumpvdl2 process (its frequency is set at launch).
+
+## Tests
+
+`test/test_coproc.cpp` is a standalone harness (no SDR++ required) that drives a
+real dumpvdl2 binary through the same `fork`/`exec`/`pipe` path the module uses,
+feeding a synthetic VDL2 burst and checking the decoded output, plus verifying
+the "binary not found" path. See the file header for the build/run command.
 
 ## License
 
-This module reuses algorithms from dumpvdl2 and is distributed under the
-**GPLv3**, consistent with that project.
+This module drives dumpvdl2 (GPLv3) as an external process and is itself
+distributed under the **GPLv3**.
